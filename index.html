@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes">
+    <title>Shooting Elite - Cash Payday</title>
+    <link rel="shortcut icon" href="TemplateData/favicon.ico">
+    <link rel="stylesheet" href="TemplateData/style.css">
+    <style>
+      /* ===== Ideofuzion template — responsive letterbox + loading UI =====
+         All overrides live inline here because Unity regenerates TemplateData/style.css
+         on every build; !important beats it. */
+
+      html, body {
+        margin: 0; padding: 0; width: 100%; height: 100%;
+        overflow: hidden; background: #0e0e12;
+      }
+
+      /* Full-viewport shell: the game's own key art, blurred right down, behind the loading UI.
+         Same idea as the other GameBull titles - the picture reads as a mood rather than as
+         detail, so the icon and the bar stay the only things in focus.
+         The blur and the darkening are baked into loading-bg.jpg rather than done with a CSS
+         filter, because filter:blur on a full-screen element is expensive on phones and the whole
+         point of this screen is that it shows while the device is busy loading 55 MB of wasm.
+         background-size:cover crops rather than stretches, so the 4:3 art still fills a wide
+         letterboxed viewport without distorting - which is why a hero image was avoided before.
+         The solid colour stays underneath as the fallback and as the letterbox bar colour. */
+      #unity-container {
+        position: fixed; inset: 0;
+        /* Torn down to flat #0e0e12 in createUnityInstance().then() (BP-1), or it keeps painting the letterbox bars. */
+        background: #0e0e12 url('TemplateData/loading-bg.jpg') center / cover no-repeat;
+      }
+
+      /* Canvas is positioned by JS (letterbox). Must be TRANSPARENT so the backdrop shows
+         through while loading; Unity fills it once the game renders. */
+      #unity-canvas {
+        display: block; position: absolute;
+        background: transparent !important;
+      }
+
+      /* ---- Loading bar ---- */
+      #unity-loading-bar {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        display: none; z-index: 10; text-align: center;
+      }
+      /* Icon area. Starts EMPTY - only the spinner shows while /context is in flight.
+         The static game icon is painted only if the tenant logo cannot be resolved
+         (JS adds .gb-fallback), so we never flash a placeholder we are about to replace. */
+      #unity-logo {
+        position: relative;
+        width: 180px; height: 180px; margin: 0 auto 12px;
+        background: none;
+      }
+      #unity-logo.gb-fallback {
+        background: url('TemplateData/game-icon.png') center / contain no-repeat;
+      }
+
+      /* Tenant logo, layered ON TOP of the static icon. Starts hidden and is only revealed
+         after the image has fully decoded, so a broken/slow URL never blanks the icon. */
+      #gb-tenant-logo {
+        position: absolute; inset: 0;
+        background-position: center; background-repeat: no-repeat; background-size: contain;
+        opacity: 0; transition: opacity .25s ease;
+      }
+      #gb-tenant-logo.gb-ready { opacity: 1; }
+
+      /* Small spinner centred INSIDE the 180px icon box, kept well clear of the progress bar
+         underneath. Lighter than the bar's fill so it reads as a separate element. */
+      #gb-spinner {
+        position: absolute; left: 50%; top: 50%;
+        width: 44px; height: 44px; margin: -22px 0 0 -22px;
+        border: 4px solid rgba(255,255,255,0.18);
+        border-top-color: #7FA8D4;
+        border-radius: 50%;
+        animation: gb-spin 0.8s linear infinite;
+      }
+      @keyframes gb-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        #gb-spinner { animation-duration: 3s; }
+      }
+      #unity-progress-bar-empty {                 /* track */
+        width: 300px; height: 18px; margin: 12px auto 0;
+        background: #d9d9d9 !important; background-image: none !important;
+        border-radius: 9px; overflow: hidden;
+      }
+      #unity-progress-bar-full {                  /* fill */
+        width: 0%; height: 100%;
+        background: #1C3A5B !important; background-image: none !important;
+        margin-top: 0 !important;                 /* fix: default style.css pushes it down */
+        border-radius: 9px; transition: width 0.1s ease;
+      }
+      #unity-progress-percent {                   /* % readout */
+        color: #F2F2F2; font: 14px arial, sans-serif; margin-top: 6px;
+      }
+
+      /* No footer in this build. */
+      #unity-footer { display: none !important; }
+      #unity-warning {
+        position: absolute; left: 50%; top: 5%; transform: translate(-50%);
+        background: white; padding: 10px; display: none; z-index: 20;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" width=2560 height=1080 tabindex="-1"></canvas>
+      <div id="unity-loading-bar">
+        <div id="unity-logo">
+          <div id="gb-tenant-logo"></div>
+          <div id="gb-spinner"></div>
+        </div>
+        <div id="unity-progress-bar-empty"><div id="unity-progress-bar-full"></div></div>
+        <div id="unity-progress-percent">0%</div>
+      </div>
+      <div id="unity-warning"> </div>
+    </div>
+    <script>
+      // ===== Tenant loading icon (GameBull /context) ================================
+      // Reads customization.gameLogoUrl from /context BEFORE Unity boots, so the loading
+      // screen shows the game's own icon while the build downloads. Entirely optional:
+      // every failure path falls back to the static TemplateData/game-icon.png.
+      //
+      // Deliberately fire-and-forget. Nothing below awaits it, so the Unity download is
+      // never delayed by this request.
+      (function loadTenantIcon() {
+        var DEFAULT_API_BASE = "https://api.staging.g-b.store";   // staging - must match GameBullEndpoints.BaseUrl
+        var DEFAULT_GAME_ID  = "shooting_elite";
+        var FETCH_TIMEOUT_MS = 4000;
+
+        var spinner = document.querySelector("#gb-spinner");
+        var target  = document.querySelector("#gb-tenant-logo");
+        var iconBox = document.querySelector("#unity-logo");
+
+        // Could not resolve a tenant logo: stop spinning and paint the static game icon,
+        // so the loading screen never sits on an endless spinner or an empty box.
+        function fallback() {
+          if (iconBox) iconBox.classList.add("gb-fallback");
+          stopSpinner();
+        }
+
+        function stopSpinner() {
+          if (spinner && spinner.parentNode) spinner.parentNode.removeChild(spinner);
+        }
+
+        try {
+          var q = new URLSearchParams(window.location.search);
+
+          // Same precedence the C# uses: sessionToken -> bootToken -> token.
+          var token      = q.get("sessionToken") || q.get("bootToken") || q.get("token");
+          var tenantSlug = q.get("tenantSlug");
+          var apiBase    = (q.get("apiBase") || DEFAULT_API_BASE).replace(/\/+$/, "");
+          var gameId     = q.get("gameId") || DEFAULT_GAME_ID;
+
+          // No credentials -> nothing to fetch. Not an error; just keep the static icon.
+          if (!tenantSlug || !token) { fallback(); return; }
+
+          // AbortController so a hung API can never pin the spinner on screen.
+          var ctrl = ("AbortController" in window) ? new AbortController() : null;
+          var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, FETCH_TIMEOUT_MS);
+
+          var url = apiBase + "/play/games/" + encodeURIComponent(gameId) +
+                    "/context?tenantSlug=" + encodeURIComponent(tenantSlug);
+
+          fetch(url, {
+            method: "GET",
+            headers: { "Authorization": "Bearer " + token },
+            signal: ctrl ? ctrl.signal : undefined
+          })
+            .then(function (r) { return r.ok ? r.json() : null; })   // 401/404 -> null -> fallback
+            .then(function (data) {
+              clearTimeout(timer);
+              var c = data && data.customization;
+
+              // customization.gameLogoUrl is the PER-GAME icon and the only field consulted here.
+              // logoUrl / tenantLogoUrl / assets[] "__logo__" are tenant-wide and have surfaced a
+              // DIFFERENT game's logo on a shared tenant, so they are deliberately not read.
+              // gameBannerUrl is the documented second choice. Neither present -> static icon.
+              var iconUrl =
+                   (c && typeof c.gameLogoUrl   === "string" && c.gameLogoUrl)   ? c.gameLogoUrl   :
+                   (c && typeof c.gameBannerUrl === "string" && c.gameBannerUrl) ? c.gameBannerUrl : null;
+
+              if (!iconUrl || !target) { fallback(); return; }
+
+              // Preload and only reveal once decoded, so a broken URL never flashes.
+              var img = new Image();
+              img.crossOrigin = "anonymous";
+              img.onload = function () {
+                target.style.backgroundImage = 'url("' + iconUrl.replace(/"/g, '%22') + '")';
+                target.classList.add("gb-ready");
+                stopSpinner();       // icon is up - stop spinning, do NOT add the static icon
+              };
+              img.onerror = fallback;
+              img.src = iconUrl;
+            })
+            .catch(function () { clearTimeout(timer); fallback(); });   // network / abort / CORS
+        } catch (e) {
+          fallback();   // URLSearchParams or fetch unavailable
+        }
+      })();
+
+      var canvas = document.querySelector("#unity-canvas");
+
+      // ===== Responsive letterbox: largest rect of the game's aspect that fits, centered =====
+      var GAME_ASPECT = 2560 / 1080;
+      function resizeCanvas() {
+        var availW = window.innerWidth, availH = window.innerHeight, w, h;
+        if (availW / availH > GAME_ASPECT) { h = availH; w = Math.round(h * GAME_ASPECT); }
+        else                               { w = availW; h = Math.round(w / GAME_ASPECT); }
+        canvas.style.width  = w + "px";
+        canvas.style.height = h + "px";
+        canvas.style.left   = Math.round((availW - w) / 2) + "px";
+        canvas.style.top    = Math.round((availH - h) / 2) + "px";
+      }
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
+
+      // ===== Single source of truth for the loading bar + percent =====
+      function setLoadProgress(p) {
+        var pct  = Math.round(p * 100);
+        var full = document.querySelector("#unity-progress-bar-full");
+        var txt  = document.querySelector("#unity-progress-percent");
+        if (full) full.style.width = pct + "%";
+        if (txt)  txt.innerText    = pct + "%";
+      }
+
+      function unityShowBanner(msg, type) {
+        var warningBanner = document.querySelector("#unity-warning");
+        function updateBannerVisibility() {
+          warningBanner.style.display = warningBanner.children.length ? 'block' : 'none';
+        }
+        var div = document.createElement('div');
+        div.innerHTML = msg;
+        warningBanner.appendChild(div);
+        if (type == 'error') div.style = 'background: red; padding: 10px;';
+        else {
+          if (type == 'warning') div.style = 'background: yellow; padding: 10px;';
+          setTimeout(function () { warningBanner.removeChild(div); updateBannerVisibility(); }, 5000);
+        }
+        updateBannerVisibility();
+      }
+
+      var buildUrl = "Build";
+      var loaderUrl = buildUrl + "/buildStaging.loader.js";
+      var config = {
+        arguments: [],
+        dataUrl: buildUrl + "/buildStaging.data",
+        frameworkUrl: buildUrl + "/buildStaging.framework.js",
+        codeUrl: buildUrl + "/buildStaging.wasm",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "Mobaso",
+        productName: "Shooting Elite - Cash Payday",
+        productVersion: "1.2",
+        showBanner: unityShowBanner,
+        // Render buffer tracks the CSS (letterboxed) canvas size -> responsive, no distortion.
+        matchWebGLToCanvasSize: true,
+      };
+
+      document.querySelector("#unity-loading-bar").style.display = "block";
+
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      script.onload = () => {
+        createUnityInstance(canvas, config, setLoadProgress).then((unityInstance) => {
+          window.unityInstance = unityInstance;
+
+          // Force 100% before hiding (Unity's onProgress plateaus at 0.9).
+          setLoadProgress(1);
+
+          // Safari/WebKit keeps painting loading elements even after display:none on a parent.
+          // Hide each element explicitly, clear any background image, then REMOVE it from the DOM
+          // so nothing can be painted. (Only #unity-logo has a background image — the game icon.)
+          function killEl(sel) {
+            var el = document.querySelector(sel);
+            if (!el) return;
+            el.style.display = "none";
+            el.style.visibility = "hidden";
+            el.style.opacity = "0";
+            el.style.backgroundImage = "none";   // kill any background image (the icon)
+            if (el.parentNode) el.parentNode.removeChild(el);
+          }
+          killEl("#gb-spinner");        // tenant-icon additions must be torn down too,
+          killEl("#gb-tenant-logo");    // or Safari keeps painting them over the game
+          killEl("#unity-logo");
+          killEl("#unity-progress-bar-full");
+          killEl("#unity-progress-bar-empty");
+          killEl("#unity-progress-percent");
+          killEl("#unity-loading-bar");
+          // BP-1: the backdrop is a LOADING backdrop. #unity-container is the full viewport and the
+          // canvas is letterboxed inside it, so leaving the image set keeps painting it in the letterbox
+          // bars for the whole session. Drop back to the flat ground colour (matches the #unity-container
+          // rule's fallback) once Unity is running.
+          var container = document.querySelector("#unity-container");
+          if (container) container.style.background = "#0e0e12";
+          // No custom loading overlay/cover div in this template — nothing else to kill.
+
+          resizeCanvas();
+
+          // ===== Page <-> game bridge (GameBull) =====
+          try { window.parent.postMessage({ type: 'game:ready' }, '*'); } catch (e) {}
+          window.addEventListener('message', function (event) {
+            var msg = event.data;
+            if (!msg || msg.type !== 'campaign:init') return;
+            var cfg = msg.config || {};
+            if (cfg.birdImage) {
+              try { unityInstance.SendMessage('Bridge', 'SetBirdImage', cfg.birdImage); } catch (e) {}
+            }
+            if (cfg.birdText !== undefined) {
+              try { unityInstance.SendMessage('Bridge', 'SetBirdText', String(cfg.birdText)); } catch (e) {}
+            }
+          });
+          // Self-test: ?birdTest=1 pushes a hot-pink circle as the bird image (needs Bridge.cs).
+          if (/[?&]birdTest=1/.test(window.location.search)) {
+            var c = document.createElement('canvas'); c.width = c.height = 256;
+            var g = c.getContext('2d');
+            g.fillStyle = '#ff17a5'; g.beginPath(); g.arc(128, 128, 120, 0, Math.PI * 2); g.fill();
+            try { unityInstance.SendMessage('Bridge', 'SetBirdImage', c.toDataURL('image/png')); } catch (e) {}
+          }
+          // Self-test: ?textTest=XXXX sets the bird text (max 5 chars enforced in C#).
+          var __t = window.location.search.match(/[?&]textTest=([^&]*)/);
+          if (__t) {
+            try { unityInstance.SendMessage('Bridge', 'SetBirdText', decodeURIComponent(__t[1])); } catch (e) {}
+          }
+        }).catch((message) => { alert(message); });
+      };
+      document.body.appendChild(script);
+    </script>
+  </body>
+</html>
